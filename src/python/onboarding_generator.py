@@ -39,8 +39,8 @@ except ImportError:
 
 COMPANY_NAME = "Waymark HR Group LLC"
 COMPANY_ADDRESS = "123 Corporate Drive, Suite 400 | Chicago, IL 60601"
-COMPANY_PHONE = "(312) 555-0100"
-COMPANY_EMAIL = "hr@waymarkhrgroup.com"
+COMPANY_PHONE = "716-225-6347"
+COMPANY_EMAIL = "Jamie.Wahler@waymarkhrgroup.com"
 COMPANY_WEBSITE = "www.waymarkhrgroup.com"
 
 # Brand colors
@@ -51,6 +51,7 @@ COLOR_TEXT = RGBColor(0x2C, 0x2C, 0x2C)       # Body text
 COLOR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 
 REPORTS_DIR = Path(__file__).resolve().parents[2] / "docs" / "reports"
+LOGO_PATH   = Path(__file__).resolve().parents[2] / "docs" / "templates" / "Waymark_HR_Group_Logo_Full.png"
 
 
 # ---------------------------------------------------------------------------
@@ -128,25 +129,25 @@ def section_divider(doc):
 # ---------------------------------------------------------------------------
 
 def build_header(doc, employee_name: str, job_title: str, start_date: str):
-    """Full-width branded header block."""
+    """Full-width branded header block with company logo."""
+    # Logo above the navy header
+    if LOGO_PATH.exists():
+        logo_para = doc.add_paragraph()
+        logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        logo_para.paragraph_format.space_before = Pt(0)
+        logo_para.paragraph_format.space_after = Pt(8)
+        logo_run = logo_para.add_run()
+        logo_run.add_picture(str(LOGO_PATH), width=Inches(3.0))
+
     table = doc.add_table(rows=1, cols=1)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     cell = table.cell(0, 0)
     set_cell_bg(cell, "1A3A5C")
     cell.width = Inches(6.5)
 
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(16)
-    p.paragraph_format.space_after = Pt(2)
-    run = p.add_run(COMPANY_NAME.upper())
-    run.bold = True
-    run.font.size = Pt(16)
-    run.font.color.rgb = COLOR_WHITE
-
-    p2 = cell.add_paragraph()
+    p2 = cell.paragraphs[0]
     p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p2.paragraph_format.space_before = Pt(0)
+    p2.paragraph_format.space_before = Pt(10)
     p2.paragraph_format.space_after = Pt(2)
     run2 = p2.add_run("Employee Onboarding Welcome Package")
     run2.font.size = Pt(11)
