@@ -49,6 +49,32 @@ This repository supports the following functions for Waymark HR Group LLC:
 
 ---
 
+## GitHub Actions Automation
+
+Every push to `main` automatically triggers the **Waymark Automation** workflow, which runs three jobs:
+
+| Job | What it does |
+|-----|-------------|
+| **Auto-Backup** | Backs up all files in `docs/reports/` as a downloadable artifact, retained for 30 days |
+| **Document Checker** | Scans any new `.docx` files added in the push and verifies required Waymark branding and contact info |
+| **Project Summary** | Counts documents generated this month, lists new files in the push, and displays a full inventory log |
+
+### How to view automation results
+
+1. Go to the repository on GitHub: [github.com/jameswahler7/Waymark-HR-Group](https://github.com/jameswahler7/Waymark-HR-Group)
+2. Click the **Actions** tab at the top
+3. Click any workflow run titled **Waymark HR Group — Automation** to open it
+4. Expand each job (**Auto-Backup**, **Document Checker**, **Project Summary**) to view detailed logs
+
+### How to download a report backup
+
+1. Open any completed workflow run in the **Actions** tab
+2. Scroll to the **Artifacts** section at the bottom of the run page
+3. Click **waymark-reports-backup-YYYY-MM-DD_HH-MM-SS** to download a `.zip` of all reports at that point in time
+4. Backups are available for **30 days** from the date of the push
+
+---
+
 ## Contact
 
 **Waymark HR Group LLC**

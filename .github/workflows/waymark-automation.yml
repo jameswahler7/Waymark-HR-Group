@@ -1,0 +1,305 @@
+name: Waymark HR Group — Automation
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1: AUTO-BACKUP
+  # Creates a timestamped backup of all files in docs/reports/ and stores
+  # it as a downloadable GitHub artifact for 30 days.
+  # ---------------------------------------------------------------------------
+  auto-backup:
+    name: Auto-Backup Reports
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "ts=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_OUTPUT
+
+      - name: Verify reports directory exists
+        run: |
+          if [ -d "docs/reports" ]; then
+            FILE_COUNT=$(find docs/reports -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
+            echo "docs/reports/ found — $FILE_COUNT file(s) present."
+          else
+            echo "docs/reports/ not found. Skipping backup."
+            exit 0
+          fi
+
+      - name: Upload reports backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: waymark-reports-backup-${{ steps.timestamp.outputs.ts }}
+          path: docs/reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Log backup summary
+        run: |
+          echo "============================================================"
+          echo "  WAYMARK HR GROUP LLC — AUTO-BACKUP"
+          echo "============================================================"
+          echo "  Timestamp : ${{ steps.timestamp.outputs.ts }}"
+          echo "  Retention : 30 days"
+          echo ""
+          echo "  Files backed up:"
+          find docs/reports -type f ! -name '.gitkeep' | sort | while read f; do
+            SIZE=$(du -sh "$f" | cut -f1)
+            echo "    [$SIZE]  $f"
+          done
+          echo "============================================================"
+
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: DOCUMENT CHECKER
+  # Scans new .docx files added to docs/reports/ in this push. Verifies each
+  # document contains required Waymark HR Group branding and metadata.
+  # ---------------------------------------------------------------------------
+  document-checker:
+    name: Document Checker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository (with full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install python-docx
+        run: pip install python-docx==1.2.0
+
+      - name: Detect new .docx files in this push
+        id: detect
+        run: |
+          # Handle first push (no parent commit) gracefully
+          if git rev-parse ${{ github.event.before }} > /dev/null 2>&1; then
+            BASE=${{ github.event.before }}
+          else
+            BASE=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          NEW_DOCS=$(git diff --name-only "$BASE" ${{ github.sha }} \
+            | grep '^docs/reports/.*\.docx$' || true)
+
+          echo "new_docs<<EOF" >> $GITHUB_OUTPUT
+          echo "$NEW_DOCS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          if [ -z "$NEW_DOCS" ]; then
+            echo "No new .docx files detected in this push."
+          else
+            echo "New .docx files detected:"
+            echo "$NEW_DOCS"
+          fi
+
+      - name: Run document compliance check
+        run: |
+          cat << 'PYEOF' > check_docs.py
+          import sys
+          import os
+          from pathlib import Path
+
+          try:
+              from docx import Document
+          except ImportError:
+              print("python-docx not available.")
+              sys.exit(1)
+
+          REQUIRED_STRINGS = [
+              "Waymark HR Group LLC",
+          ]
+
+          RECOMMENDED_STRINGS = [
+              "716-225-6347",
+              "Jamie.Wahler@waymarkhrgroup.com",
+          ]
+
+          docs_input = """${{ steps.detect.outputs.new_docs }}""".strip()
+
+          if not docs_input:
+              print("=" * 60)
+              print("  DOCUMENT CHECKER")
+              print("=" * 60)
+              print("  No new .docx files in this push. Nothing to check.")
+              print("=" * 60)
+              sys.exit(0)
+
+          files = [f.strip() for f in docs_input.splitlines() if f.strip()]
+          errors = []
+          warnings = []
+          passed = []
+
+          print("=" * 60)
+          print("  WAYMARK HR GROUP LLC — DOCUMENT CHECKER")
+          print("=" * 60)
+
+          for filepath in files:
+              p = Path(filepath)
+              if not p.exists():
+                  warnings.append(f"File not found on disk: {filepath}")
+                  continue
+
+              print(f"\n  Checking: {p.name}")
+
+              try:
+                  doc = Document(str(p))
+                  full_text = "\n".join([para.text for para in doc.paragraphs])
+
+                  file_errors = []
+                  file_warnings = []
+
+                  for req in REQUIRED_STRINGS:
+                      if req.lower() not in full_text.lower():
+                          file_errors.append(f"Missing required text: '{req}'")
+
+                  for rec in RECOMMENDED_STRINGS:
+                      if rec.lower() not in full_text.lower():
+                          file_warnings.append(f"Missing recommended contact info: '{rec}'")
+
+                  if file_errors:
+                      for e in file_errors:
+                          print(f"    ERROR   : {e}")
+                          errors.append(f"{p.name} — {e}")
+                  if file_warnings:
+                      for w in file_warnings:
+                          print(f"    WARNING : {w}")
+                          warnings.append(f"{p.name} — {w}")
+                  if not file_errors and not file_warnings:
+                      print(f"    PASSED  : All checks passed.")
+                      passed.append(p.name)
+                  elif not file_errors:
+                      print(f"    PASSED  : Required checks passed (see warnings above).")
+                      passed.append(p.name)
+
+              except Exception as e:
+                  msg = f"Could not read file: {e}"
+                  print(f"    ERROR   : {msg}")
+                  errors.append(f"{p.name} — {msg}")
+
+          print("\n" + "=" * 60)
+          print(f"  SUMMARY: {len(passed)} passed, {len(warnings)} warning(s), {len(errors)} error(s)")
+          print("=" * 60)
+
+          if errors:
+              print("\n  ERRORS (action required):")
+              for e in errors:
+                  print(f"    • {e}")
+
+          if warnings:
+              print("\n  WARNINGS (recommended fixes):")
+              for w in warnings:
+                  print(f"    • {w}")
+
+          if errors:
+              sys.exit(1)
+          PYEOF
+
+          python3 check_docs.py
+
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: PROJECT SUMMARY
+  # Counts documents generated this month, lists all new files in this push,
+  # and displays a full project summary in the workflow log.
+  # ---------------------------------------------------------------------------
+  project-summary:
+    name: Project Summary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository (with full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate project summary
+        run: |
+          CURRENT_MONTH=$(date +'%Y-%m')
+          CURRENT_MONTH_LABEL=$(date +'%B %Y')
+
+          echo "============================================================"
+          echo "  WAYMARK HR GROUP LLC — PROJECT SUMMARY"
+          echo "  Push to: ${{ github.ref_name }}  |  Commit: ${{ github.sha }}"
+          echo "  Triggered by: ${{ github.actor }}"
+          echo "  Date: $(date +'%B %d, %Y at %H:%M UTC')"
+          echo "============================================================"
+
+          # New files in this push
+          echo ""
+          echo "  FILES ADDED IN THIS PUSH:"
+          if git rev-parse ${{ github.event.before }} > /dev/null 2>&1; then
+            BASE=${{ github.event.before }}
+          else
+            BASE=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          NEW_FILES=$(git diff --name-only --diff-filter=A "$BASE" ${{ github.sha }} || true)
+          if [ -z "$NEW_FILES" ]; then
+            echo "    (no new files in this push)"
+          else
+            echo "$NEW_FILES" | while read f; do
+              echo "    + $f"
+            done
+          fi
+
+          # Documents generated this month
+          echo ""
+          echo "  DOCUMENTS GENERATED THIS MONTH ($CURRENT_MONTH_LABEL):"
+          MONTH_DOCS=$(find docs/reports -type f -name "*${CURRENT_MONTH}*.docx" 2>/dev/null | sort)
+          if [ -z "$MONTH_DOCS" ]; then
+            echo "    (none found for $CURRENT_MONTH_LABEL)"
+          else
+            COUNT=0
+            echo "$MONTH_DOCS" | while read f; do
+              SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)
+              echo "    [$SIZE]  $(basename $f)"
+            done
+            TOTAL=$(echo "$MONTH_DOCS" | wc -l | tr -d ' ')
+            echo ""
+            echo "  Total documents this month: $TOTAL"
+          fi
+
+          # Python scripts inventory
+          echo ""
+          echo "  PYTHON SCRIPTS:"
+          find src/python -name "*.py" | sort | while read f; do
+            LINES=$(wc -l < "$f")
+            echo "    $f  ($LINES lines)"
+          done
+
+          # Full reports inventory
+          echo ""
+          echo "  ALL REPORTS IN docs/reports/:"
+          TOTAL_REPORTS=$(find docs/reports -name "*.docx" | wc -l | tr -d ' ')
+          find docs/reports -name "*.docx" | sort | while read f; do
+            SIZE=$(du -sh "$f" | cut -f1)
+            echo "    [$SIZE]  $(basename $f)"
+          done
+          echo ""
+          echo "  Total reports on file: $TOTAL_REPORTS"
+
+          # Spreadsheets
+          echo ""
+          echo "  SPREADSHEETS:"
+          find data/spreadsheets -name "*.xlsx" -o -name "*.csv" 2>/dev/null | sort | while read f; do
+            SIZE=$(du -sh "$f" | cut -f1)
+            echo "    [$SIZE]  $(basename $f)"
+          done
+
+          echo ""
+          echo "============================================================"
+          echo "  Workflow complete."
+          echo "============================================================"
