@@ -1,0 +1,21 @@
+employee_id,first_name,last_name,department,job_title,employment_type,hire_date,annual_salary,last_performance_review
+E001,Alex,Chen,Engineering,Software Engineer,Full-Time,2022-01-15,95000,2025-12-01
+E002,Maria,Rodriguez,Engineering,Senior Software Engineer,Full-Time,2019-06-01,115000,2025-12-01
+E003,James,Kim,Engineering,DevOps Engineer,Full-Time,2023-09-10,98000,2025-11-15
+E004,Sarah,Thompson,Engineering,Software Engineer,Full-Time,2025-10-20,80000,
+E005,David,Park,Engineering,QA Engineer,Part-Time,2024-03-01,52000,2025-12-01
+E006,Jennifer,Walsh,Sales,Account Executive,Full-Time,2021-07-12,72000,2025-11-01
+E007,Michael,Torres,Sales,Senior Account Executive,Full-Time,2018-03-05,88000,2025-11-01
+E008,Rachel,Green,Sales,Sales Development Rep,Full-Time,2025-11-15,58000,
+E009,Kevin,Brown,Sales,Account Executive,Full-Time,2023-01-20,74000,2025-11-01
+E010,Lisa,Martinez,Sales,Sales Manager,Full-Time,2020-08-10,95000,2025-11-01
+E011,Robert,Johnson,Operations,Operations Coordinator,Full-Time,2022-05-16,62000,2025-10-15
+E012,Ashley,Williams,Operations,Operations Manager,Full-Time,2017-11-01,85000,2025-10-15
+E013,Christopher,Davis,Operations,Logistics Analyst,Full-Time,2024-08-05,68000,2025-10-15
+E014,Amanda,Miller,Operations,Operations Coordinator,Part-Time,2025-12-01,36000,
+E015,Thomas,Wilson,Operations,Supply Chain Specialist,Full-Time,2023-04-22,72000,2025-10-15
+E016,Nicole,Anderson,Human Resources,HR Generalist,Full-Time,2021-09-08,65000,2025-12-15
+E017,Brian,Taylor,Human Resources,HR Manager,Full-Time,2019-02-14,82000,2025-12-15
+E018,Stephanie,Jackson,Human Resources,Recruiter,Full-Time,2022-11-30,63000,2025-12-15
+E019,Daniel,White,Human Resources,HR Coordinator,Part-Time,2026-01-15,38000,
+E020,Emily,Harris,Human Resources,Benefits Specialist,Full-Time,2023-06-19,67000,2025-12-15
