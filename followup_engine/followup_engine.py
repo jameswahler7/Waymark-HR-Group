@@ -91,6 +91,13 @@ def init_db():
         )
     """)
     conn.commit()
+    # Migrate: add sent_at columns if they don't exist
+    for col in ["followup1_sent_at", "followup2_sent_at"]:
+        try:
+            conn.execute(f"ALTER TABLE prospects ADD COLUMN {col} TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     return conn
 
 def get_gmail_service():
@@ -208,7 +215,7 @@ Return ONLY valid JSON no markdown no extra text:
     data = json.loads(raw)
     return data["subject"], data["body"]
 
-COLS = ["id","gmail_message_id","prospect_name","company_name","email_address","subject","sent_date","original_body","followup1_due","followup1_draft_id","followup1_created_at","followup2_due","followup2_draft_id","followup2_created_at","status"]
+COLS = ["id","gmail_message_id","prospect_name","company_name","email_address","subject","sent_date","original_body","followup1_due","followup1_draft_id","followup1_created_at","followup2_due","followup2_draft_id","followup2_created_at","status","followup1_sent_at","followup2_sent_at"]
 
 def run():
     log.info("Waymark Follow-Up Engine Starting")
@@ -238,6 +245,12 @@ def run():
     log.info(f"Due today - Day 4: {len(due_fu1)} | Day 10: {len(due_fu2)}")
     for row in due_fu1:
         p = dict(zip(COLS, row))
+        if p.get("followup1_draft_id"):
+            log.info(f"Skipping {p['email_address']} — draft already exists.")
+            continue
+        if p.get("followup1_sent_at"):
+            log.info(f"Skipping {p['email_address']} — follow-up already sent.")
+            continue
         log.info(f"Writing Day 4 follow-up for {p['company_name'] or p['email_address']}")
         try:
             subject, body = generate_followup(p, followup_num=1)
@@ -258,6 +271,12 @@ def run():
             log.error(f"Failed: {e}")
     for row in due_fu2:
         p = dict(zip(COLS, row))
+        if p.get("followup2_draft_id"):
+            log.info(f"Skipping {p['email_address']} — draft already exists.")
+            continue
+        if p.get("followup2_sent_at"):
+            log.info(f"Skipping {p['email_address']} — follow-up already sent.")
+            continue
         log.info(f"Writing Day 10 follow-up for {p['company_name'] or p['email_address']}")
         try:
             subject, body = generate_followup(p, followup_num=2)
