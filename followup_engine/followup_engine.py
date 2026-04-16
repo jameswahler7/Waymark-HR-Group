@@ -21,7 +21,7 @@ CONFIG = {
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 SALES_CONTEXT = """
 You write follow-up cold emails for Waymark HR Group, a fractional HR consulting firm in Buffalo/Western New York serving small businesses 1-125 employees in construction, trades, manufacturing, landscaping, restaurants, and dental.
