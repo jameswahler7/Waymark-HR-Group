@@ -91,6 +91,18 @@ That's it. The engine picks it up on the next 15-minute tick, researches the com
 
 ## FILE STRUCTURE
 
+### Source-of-truth docs (project root)
+
+**Location:** `/Users/jamie/Documents/waymark-hr-group/`
+
+| File | Purpose |
+|---|---|
+| `WAYMARK_COLD_EMAIL_SKILL.md` | SOURCE OF TRUTH for all email content rules — loaded verbatim as the system prompt by `email_generator.py` |
+| `WAYMARK_GMAIL_COLD_EMAIL_ENGINE_v2_MASTER_PROMPT.md` | Full v2 build spec (architecture, sections 1–17) |
+| `WAYMARK_ENGINE_OPERATIONS_MANUAL.md` | This file |
+
+### Engine code
+
 **Location:** `/Users/jamie/Documents/waymark-hr-group/followup_engine/`
 
 | File | Purpose |
@@ -108,7 +120,6 @@ That's it. The engine picks it up on the next 15-minute tick, researches the com
 | `business_day_calc.py` | Business day math (M–F minus US federal holidays) |
 | `db_v2.py` | SQLite database helpers |
 | `gmail_auth.py` | Google OAuth helper |
-| `WAYMARK_COLD_EMAIL_SKILL.md` | SOURCE OF TRUTH for all email content rules |
 | `.env` | API keys (Anthropic, Pushover, Google OAuth) |
 | `waymark_engine.db` | SQLite database |
 | `logs/waymark_engine.log` | Full run log |
