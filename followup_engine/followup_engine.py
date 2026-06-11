@@ -1,338 +1,615 @@
 #!/usr/bin/env python3
-import os, json, sqlite3, base64, logging
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-import anthropic
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+"""
+followup_engine.py — Waymark Cold Email Engine v2 — Phase 1 + Phase 2
+
+Phase 1 (live, tested 2026-06-10):
+  - Intake parser (3-line Gmail draft format)
+  - Auto-enrichment via Anthropic web_search
+  - Auto-angle picker (HIRING vs COMPLIANCE)
+  - Touch 1 email generator using WAYMARK_COLD_EMAIL_SKILL.md
+  - Gmail 11-label state machine
+  - Send pacing
+  - SQLite operational DB
+
+Phase 2 (this build):
+  - Touch 2 generator (+3 biz days, primary angle reinforced, primary URL)
+  - Touch 3 generator (+5 biz days from T2, PIVOT to secondary, secondary URL)
+  - Touch 4 generator (+4 biz days from T3, breakup)
+  - Business-day eligibility calculator (respects holiday_calendar)
+  - Send-order priority: T4 -> T3 -> T2 -> T1 (warm threads finish first)
+  - Threaded replies (In-Reply-To + References headers, threadId nesting)
+  - Minimal reply-pause safeguard: any inbound message on a sent thread
+    moves it to 06_REPLIED 🔥 instead of firing the next touch
+
+Not in Phase 2 (Phase 3-4):
+  - Full polling-based reply detection + OOO filter
+  - Pushover notifications
+  - Daily report email
+  - Bounce monitoring
+
+CLI:
+  python3 followup_engine.py                  # send up to 1 lead, real send, with pacing
+  python3 followup_engine.py --dry-run        # generate but do NOT send/label
+  python3 followup_engine.py --limit 3        # send up to 3 leads this run
+  python3 followup_engine.py --ignore-pacing  # bypass pacing (testing only — still respects daily cap)
+  python3 followup_engine.py --test-mode      # allow consumer domains as recipients
+  python3 followup_engine.py --list-only      # print queued + eligible follow-ups
+  python3 followup_engine.py --only-touch 1   # only process T1 sends this run (or 2/3/4)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import traceback
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+# Load .env BEFORE importing modules that instantiate the Anthropic client.
+from dotenv import load_dotenv
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_THIS_DIR, ".env"))
+load_dotenv(os.path.join(os.path.dirname(_THIS_DIR), ".env"))
+
+# Local modules
+from gmail_auth import get_gmail_service, get_sender_address
+from db_v2 import (
+    init_db, cache_enrichment, get_cached_enrichment, log_send, log_error,
+    already_sent, is_blocked, get_last_send_for_thread,
+    add_do_not_contact, add_bounce,
+    is_reply_notified, mark_reply_notified,
+)
+from label_manager import (
+    LabelManager,
+    LABEL_QUEUED, LABEL_SENT_T1, LABEL_SENT_T2, LABEL_SENT_T3, LABEL_SENT_T4,
+    LABEL_REPLIED, LABEL_INVALID, LABEL_ENRICH_FAILED, LABEL_GEN_FAILED,
+    LABEL_DO_NOT_CONTACT, LABEL_CLOSED_LOST,
+)
+from intake_parser import parse_queued_draft, ValidationError
+from enrichment import enrich_lead, EnrichmentError
+from email_generator import (
+    generate_t1, generate_t2, generate_t3, generate_t4, GenerationError,
+)
+from send_engine import (
+    can_send_now, send_t1_via_new_message, send_followup_reply,
+    get_thread_metadata, delete_intake_draft, now_eastern_str, _now_eastern,
+)
+from business_day_calc import is_eligible
+from reply_classifier import classify_thread
+from notifier import (
+    send_pushover, send_email_alert, gmail_thread_url, pushover_enabled,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG = {
-    "label_name": "waymark/cold-outreach",
-    "followup1_days": 6,   # Day 5-7 window — midpoint is 6
-    "followup2_days": 13,  # Day 12-14 window — midpoint is 13
-    "db_path": os.path.join(BASE_DIR, "tracker.db"),
-    "token_path": os.path.join(BASE_DIR, "token.json"),
-    "credentials_path": os.path.join(BASE_DIR, "credentials.json"),
-    "log_path": os.path.join(BASE_DIR, "logs", "followup_engine.log"),
-}
-GMAIL_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
-SALES_CONTEXT = """
-You write follow-up cold emails for James Wahler, SHRM-CP — founder of Waymark HR Group, a fractional HR consulting firm serving small manufacturers in Western New York (Erie and Niagara County).
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+DB_PATH = os.path.join(BASE_DIR, "waymark_engine.db")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_PATH = os.path.join(LOG_DIR, "waymark_engine.log")
+SKILL_FILE = os.path.join(PROJECT_ROOT, "WAYMARK_COLD_EMAIL_SKILL.md")
 
-WHO WE TARGET:
-- Owners, Founders, and Presidents of WNY manufacturing companies
-- Company size: 25–100 employees
-- Industries: metal fabrication, food & beverage manufacturing, plastics, industrial machinery, medical devices, electronics manufacturing
-- These owners are typically handling HR themselves — no dedicated HR staff
+# Spec SECTION 5
+SENDER_EMAIL = "Jamie.wahler@waymarkhrgroup.com"
+SENDER_NAME = "Jamie Wahler"
 
-WHO WE DO NOT TARGET:
-- Companies with an HR Manager or HR Director already on staff
-- Trades, construction, restaurants, dental, landscaping (that was the old target — do not reference these)
+# Spec SECTION 2 — business-day eligibility windows.
+T2_BIZ_DAYS = 3
+T3_BIZ_DAYS = 5
+T4_BIZ_DAYS = 4
 
-VALUE PROPOSITION:
-- James is a SHRM-CP certified HR professional with 10 years of real HR experience
-- He spent 6 years as Director of HR at a WNY manufacturing company — he understands the shop floor, shift worker classification, OSHA recordkeeping, and manufacturing-specific compliance
-- Waymark provides fractional HR: handbooks, compliance audits, I-9s, employee relations, terminations, policy development
-- AI-assisted recruiting to cut hiring time without paying a $15,000 recruiter fee
-- Far less expensive than a full-time HR hire ($80K–$130K/yr vs a fractional retainer)
-- Free 30-minute HR audit: https://calendly.com/jamie-wahler-waymarkhrgroup/30min
 
-MANUFACTURING PAIN POINTS TO DRAW FROM:
-- I-9 paperwork not audited in years — easy compliance exposure
-- NY paid leave requirements expanded in 2025 — most manufacturers under 50 employees missed it
-- Outdated or nonexistent employee handbooks
-- Undocumented terminations and disciplinary actions — high litigation risk
-- Misclassified shift workers or independent contractors
-- Owner handling all HR themselves alongside running the operation
-- Difficulty finding and retaining skilled manufacturing workers in WNY
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-FOLLOW-UP RULES:
-1. Goal = ONE reply. Not a close. Keep it very short.
-2. Never restart the conversation. Reference the original email naturally in one sentence max.
-3. Lead with something relevant to their world, then bridge to the ask.
-4. Single clear ask — never two asks in one email.
-5. Never use the old "ATTENTION:" opener or bold the recipient's name.
-6. Never sound apologetic. Confident, direct, conversational.
-7. No fluff, no filler phrases like "I hope this finds you well."
+def setup_logging() -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_PATH),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
-TONE: Direct, confident, peer-to-peer. Like one professional writing to another.
-LENGTH: Follow-up 1 body under 80 words. Follow-up 2 body under 65 words. Shorter is always better.
 
-SIGNATURE — always use exactly this format:
-James Wahler, SHRM-CP
-Founder | Waymark HR Group
-(716) 225-6347 | waymarkhrgroup.com
-"""
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
-os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(CONFIG["log_path"]),
-        logging.StreamHandler()
-    ]
-)
-log = logging.getLogger(__name__)
+def run_engine(args: argparse.Namespace) -> int:
+    log = logging.getLogger("orchestrator")
 
-def init_db():
-    conn = sqlite3.connect(CONFIG["db_path"])
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS prospects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            gmail_message_id TEXT UNIQUE NOT NULL,
-            prospect_name TEXT,
-            company_name TEXT,
-            email_address TEXT NOT NULL,
-            subject TEXT,
-            sent_date TEXT NOT NULL,
-            original_body TEXT,
-            followup1_due TEXT,
-            followup1_draft_id TEXT,
-            followup1_created_at TEXT,
-            followup2_due TEXT,
-            followup2_draft_id TEXT,
-            followup2_created_at TEXT,
-            status TEXT DEFAULT 'active'
+    if not os.path.exists(SKILL_FILE):
+        log.error(f"Skill file not found: {SKILL_FILE}")
+        return 2
+
+    log.info(f"Waymark Engine v2 (Phases 1+2) starting at {now_eastern_str()}")
+    log.info(
+        f"Args: dry_run={args.dry_run} limit={args.limit} "
+        f"ignore_pacing={args.ignore_pacing} test_mode={args.test_mode} "
+        f"list_only={args.list_only} only_touch={args.only_touch}"
+    )
+
+    conn = init_db(DB_PATH)
+    service = get_gmail_service(BASE_DIR)
+    auth_addr = get_sender_address(service)
+    log.info(f"Authenticated mailbox: {auth_addr}")
+    if auth_addr.lower() != SENDER_EMAIL.lower():
+        log.warning(
+            f"Mailbox {auth_addr!r} != expected {SENDER_EMAIL!r}. "
+            "Sends will go from the authenticated address."
         )
-    """)
-    conn.commit()
-    # Migrate: add sent_at columns if they don't exist
-    for col in ["followup1_sent_at", "followup2_sent_at"]:
-        try:
-            conn.execute(f"ALTER TABLE prospects ADD COLUMN {col} TEXT")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-    return conn
 
-def get_gmail_service():
-    creds = None
-    if os.path.exists(CONFIG["token_path"]):
-        creds = Credentials.from_authorized_user_file(CONFIG["token_path"], GMAIL_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CONFIG["credentials_path"], GMAIL_SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(CONFIG["token_path"], "w") as f:
-            f.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds)
+    lm = LabelManager(service)
+    lm.ensure_labels()
 
-def get_or_create_label(service, label_name):
-    labels = service.users().labels().list(userId="me").execute().get("labels", [])
-    for label in labels:
-        if label["name"].lower() == label_name.lower():
-            return label["id"]
-    new_label = service.users().labels().create(
-        userId="me",
-        body={
-            "name": label_name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-            "color": {"backgroundColor": "#16a765", "textColor": "#ffffff"}
-        }
-    ).execute()
-    log.info(f"Created Gmail label: {label_name}")
-    return new_label["id"]
+    # Build the eligible work list across all four touches, in priority order:
+    #   T4 (breakups) -> T3 (pivots) -> T2 (follow-ups) -> T1 (cold opens)
+    work = _build_work_list(args, log, conn, lm, service, auth_addr)
+    log.info(
+        "Eligible: "
+        + ", ".join(f"T{t}={len([w for w in work if w[0]==t])}" for t in (4, 3, 2, 1))
+    )
 
-def get_labeled_sent_emails(service, label_id):
-    results = service.users().messages().list(
-        userId="me", labelIds=[label_id, "SENT"], q="-in:trash", maxResults=500
-    ).execute()
-    return results.get("messages", [])
+    if args.list_only:
+        for touch, thread_id, _ in work:
+            print(f"  T{touch}  thread={thread_id}")
+        conn.close()
+        return 0
 
-def get_message_details(service, msg_id):
-    msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
-    headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-    body = ""
-    payload = msg["payload"]
-    if "parts" in payload:
-        for part in payload["parts"]:
-            if part["mimeType"] == "text/plain":
-                data = part["body"].get("data", "")
-                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-                break
-    elif payload.get("body", {}).get("data"):
-        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-    sent_date = datetime.fromtimestamp(int(msg["internalDate"]) / 1000).strftime("%Y-%m-%d")
-    to_header = headers.get("To", "")
-    email_address = to_header
-    prospect_name = ""
-    if "<" in to_header:
-        prospect_name = to_header.split("<")[0].strip().strip('"')
-        email_address = to_header.split("<")[1].strip(">").strip()
-    subject = headers.get("Subject", "")
-    company_name = ""
-    for pattern in [" for ", " - ", " | "]:
-        if pattern.lower() in subject.lower():
-            company_name = subject.lower().split(pattern.lower())[-1].strip().title()
+    sent_count = 0
+    for touch_number, thread_id, payload in work:
+        if sent_count >= args.limit:
+            log.info(f"Reached --limit {args.limit}; stopping for this run.")
             break
+
+        allowed, reason = can_send_now(conn, ignore_pacing=args.ignore_pacing)
+        if not allowed:
+            log.info(f"Pacing block: {reason}. Exiting this tick.")
+            break
+
+        if _try_process_one(args, log, conn, lm, service, auth_addr,
+                            touch_number, thread_id, payload):
+            sent_count += 1
+
+    log.info(f"Run complete. Sends this run: {sent_count}")
+    conn.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Work-list assembly
+# ---------------------------------------------------------------------------
+
+def _build_work_list(
+    args, log, conn, lm: LabelManager, service, our_email: str,
+) -> List[Tuple[int, str, dict]]:
+    """Return a list of (touch_number, thread_id, payload) sorted by spec priority.
+
+    payload contains everything _try_process_one needs to fire that touch
+    without re-querying. For T1 the payload is the draft dict; for T2-T4
+    it carries the cached enrichment + thread metadata.
+    """
+    now_et = _now_eastern()
+    work: List[Tuple[int, str, dict]] = []
+
+    # ---- T4 (breakups) ----
+    if args.only_touch in (None, 4):
+        for thread_id in lm.get_threads_in_label(LABEL_SENT_T3):
+            payload = _followup_payload(
+                conn, service, thread_id, prev_touch=3, n_biz_days=T4_BIZ_DAYS,
+                our_email=our_email, now_et=now_et, log=log,
+            )
+            if payload:
+                work.append((4, thread_id, payload))
+
+    # ---- T3 (pivots) ----
+    if args.only_touch in (None, 3):
+        for thread_id in lm.get_threads_in_label(LABEL_SENT_T2):
+            payload = _followup_payload(
+                conn, service, thread_id, prev_touch=2, n_biz_days=T3_BIZ_DAYS,
+                our_email=our_email, now_et=now_et, log=log,
+            )
+            if payload:
+                work.append((3, thread_id, payload))
+
+    # ---- T2 (first follow-ups) ----
+    if args.only_touch in (None, 2):
+        for thread_id in lm.get_threads_in_label(LABEL_SENT_T1):
+            payload = _followup_payload(
+                conn, service, thread_id, prev_touch=1, n_biz_days=T2_BIZ_DAYS,
+                our_email=our_email, now_et=now_et, log=log,
+            )
+            if payload:
+                work.append((2, thread_id, payload))
+
+    # ---- T1 (new cold opens, from 01_QUEUED draft folder) ----
+    if args.only_touch in (None, 1):
+        queued = lm.get_queued_drafts()
+        for draft in queued:
+            work.append((1, draft["thread_id"], {"draft": draft}))
+
+    return work
+
+
+def _followup_payload(
+    conn, service, thread_id: str,
+    *, prev_touch: int, n_biz_days: int, our_email: str, now_et, log,
+) -> Optional[dict]:
+    """Decide whether `thread_id` is eligible for the next touch.
+
+    Returns a payload dict if eligible, else None.
+    """
+    last = get_last_send_for_thread(conn, thread_id)
+    if not last:
+        log.warning(
+            f"Thread {thread_id} is in SENT_T{prev_touch} label but has no send_log row. "
+            "Skipping (manual investigation needed)."
+        )
+        return None
+    if last["touch_number"] != prev_touch:
+        log.warning(
+            f"Thread {thread_id} label says SENT_T{prev_touch} but send_log says "
+            f"last touch was T{last['touch_number']}. Skipping."
+        )
+        return None
+
+    sent_at = datetime.fromisoformat(last["sent_at"])
+    if not is_eligible(conn, sent_at, n_biz_days, now_et):
+        return None
+
+    enrichment = get_cached_enrichment(conn, thread_id)
+    if not enrichment:
+        log.warning(
+            f"Thread {thread_id} eligible but no cached enrichment. Skipping."
+        )
+        return None
+
     return {
-        "message_id": msg_id,
-        "subject": subject,
-        "email_address": email_address,
-        "prospect_name": prospect_name,
-        "company_name": company_name,
-        "sent_date": sent_date,
-        "body": body.strip(),
+        "enrichment": enrichment,
+        "last_send": last,
     }
 
-def create_draft(service, to_email, subject, body):
-    message = MIMEText(body, "plain")
-    message["to"] = to_email
-    message["subject"] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    draft = service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
-    return draft["id"], draft["message"]["threadId"]
 
-def generate_followup(prospect, followup_num):
-    client = anthropic.Anthropic()
-    day = CONFIG[f"followup{followup_num}_days"]
-    if followup_num == 1:
-        instruction = f"""Write Follow-Up #1 (Day {day}) — Touch 1 of 2.
+# ---------------------------------------------------------------------------
+# Per-thread processing
+# ---------------------------------------------------------------------------
 
-This is a short, warm re-engagement. The goal is one reply — not a close.
-
-Structure:
-1. One sentence referencing the original email naturally (do not restart the conversation).
-2. One relevant manufacturing pain point — pick the most fitting one based on the original email and company details. Examples: NY paid leave documentation, I-9 audit exposure, undocumented termination risk, difficulty finding manufacturing workers.
-3. Close with this exact offer: offer to send a one-page checklist of the 5 NY employment law requirements that trip up manufacturers most often — OR if they prefer, a free 30-minute HR audit call at https://calendly.com/jamie-wahler-waymarkhrgroup/30min. Frame both as no obligation.
-
-Body under 80 words, not counting signature. No "Thank you for your time." No filler openers."""
+def _try_process_one(
+    args, log, conn, lm: LabelManager, service, our_email: str,
+    touch_number: int, thread_id: str, payload: dict,
+) -> bool:
+    """Process one touch end-to-end. Returns True if a send was made."""
+    if touch_number == 1:
+        return _process_t1(args, log, conn, lm, service, payload["draft"])
     else:
-        instruction = f"""Write Follow-Up #2 (Day {day}) — Touch 2 of 2. This is the final email.
+        return _process_followup(
+            args, log, conn, lm, service, our_email,
+            touch_number, thread_id, payload,
+        )
 
-Keep it brief and confident. Give them a graceful exit. Do not push hard.
 
-Structure:
-1. One line: this is the last note.
-2. One sentence: if HR ever becomes a priority (complaint, audit, employee issue, outdated policies), James is available.
-3. Close with the free audit link: https://calendly.com/jamie-wahler-waymarkhrgroup/30min and note the offer stands whenever they're ready.
-4. Sign off with "Best," above the signature.
+# ---- T1 -------------------------------------------------------------------
 
-Body under 65 words, not counting signature. No "Thank you for your time." No filler."""
+def _process_t1(args, log, conn, lm, service, draft) -> bool:
+    thread_id = draft["thread_id"]
+    draft_id = draft.get("draft_id")
 
-    prompt = f"""{SALES_CONTEXT}
+    if already_sent(conn, thread_id, 1):
+        log.warning(f"Thread {thread_id} already has T1. Fixing label only.")
+        _safe_move(lm, thread_id, LABEL_QUEUED, LABEL_SENT_T1, log)
+        return False
 
-{instruction}
+    try:
+        lead = parse_queued_draft(
+            draft,
+            is_blocked_fn=lambda addr: is_blocked(conn, addr),
+            allow_consumer=args.test_mode,
+        )
+    except ValidationError as exc:
+        log.warning(f"INVALID input on thread {thread_id}: {exc}")
+        log_error(conn, "warning", thread_id, f"intake: {exc}")
+        if not args.dry_run:
+            _safe_move(lm, thread_id, LABEL_QUEUED, LABEL_INVALID, log)
+        return False
 
-ORIGINAL EMAIL (Day 0):
-Subject: {prospect['subject']}
-To: {prospect['prospect_name'] or prospect['email_address']}
----
-{prospect['original_body']}
----
+    log.info(f"T1 parsed: {lead.first_name} <{lead.email}> {lead.company_url}")
 
-PROSPECT DETAILS:
-First name: {prospect['prospect_name'].split()[0] if prospect['prospect_name'] else 'there'}
-Company: {prospect['company_name'] or 'their business'}
-Email: {prospect['email_address']}
+    try:
+        enrichment = enrich_lead(lead)
+    except EnrichmentError as exc:
+        log.error(f"ENRICHMENT_FAILED on thread {thread_id}: {exc}")
+        log_error(conn, "error", thread_id, f"enrichment: {exc}")
+        if not args.dry_run:
+            _safe_move(lm, thread_id, LABEL_QUEUED, LABEL_ENRICH_FAILED, log)
+        return False
 
-Return ONLY valid JSON — no markdown, no extra text, no code fences:
-{{"subject": "Re: {prospect['subject']}", "body": "Full email body with signature at the end."}}"""
-
-    resp = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}]
+    log.info(
+        f"Enriched: angle={enrichment.get('primary_angle')} "
+        f"anchor={(enrichment.get('best_anchor') or '')[:120]!r}"
     )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
-    return data["subject"], data["body"]
 
-COLS = ["id","gmail_message_id","prospect_name","company_name","email_address","subject","sent_date","original_body","followup1_due","followup1_draft_id","followup1_created_at","followup2_due","followup2_draft_id","followup2_created_at","status","followup1_sent_at","followup2_sent_at"]
+    try:
+        email = generate_t1(enrichment, SKILL_FILE)
+    except GenerationError as exc:
+        log.error(f"T1 GENERATION_FAILED on thread {thread_id}: {exc}")
+        log_error(conn, "error", thread_id, f"t1 generation: {exc}")
+        if not args.dry_run:
+            _safe_move(lm, thread_id, LABEL_QUEUED, LABEL_GEN_FAILED, log)
+        return False
 
-def run():
-    log.info("Waymark Follow-Up Engine Starting")
-    conn = init_db()
-    service = get_gmail_service()
-    label_id = get_or_create_label(service, CONFIG["label_name"])
-    today_str = datetime.now().date().strftime("%Y-%m-%d")
-    log.info("Scanning Gmail for waymark/cold-outreach labeled emails")
-    messages = get_labeled_sent_emails(service, label_id)
-    new_count = 0
-    for msg_ref in messages:
-        msg_id = msg_ref["id"]
-        if conn.execute("SELECT 1 FROM prospects WHERE gmail_message_id = ?", (msg_id,)).fetchone():
-            continue
-        d = get_message_details(service, msg_id)
-        sent = datetime.strptime(d["sent_date"], "%Y-%m-%d")
-        if sent.date() < datetime.strptime("2026-04-19", "%Y-%m-%d").date():
-            continue
-        fu1 = (sent + timedelta(days=CONFIG["followup1_days"])).strftime("%Y-%m-%d")
-        fu2 = (sent + timedelta(days=CONFIG["followup2_days"])).strftime("%Y-%m-%d")
-        conn.execute("INSERT INTO prospects (gmail_message_id, prospect_name, company_name, email_address, subject, sent_date, original_body, followup1_due, followup2_due) VALUES (?,?,?,?,?,?,?,?,?)",
-            (msg_id, d["prospect_name"], d["company_name"], d["email_address"], d["subject"], d["sent_date"], d["body"], fu1, fu2))
-        conn.commit()
-        new_count += 1
-        log.info(f"Tracked: {d['company_name'] or d['email_address']} | FU1 due: {fu1} | FU2 due: {fu2}")
-    log.info(f"New prospects tracked: {new_count}")
-    due_fu1 = conn.execute("SELECT * FROM prospects WHERE status = 'active' AND followup1_due <= ? AND followup1_draft_id IS NULL", (today_str,)).fetchall()
-    due_fu2 = conn.execute("SELECT * FROM prospects WHERE status = 'active' AND followup2_due <= ? AND followup1_draft_id IS NOT NULL AND followup2_draft_id IS NULL", (today_str,)).fetchall()
-    log.info(f"Due today — Day 6 follow-ups: {len(due_fu1)} | Day 13 follow-ups: {len(due_fu2)}")
-    for row in due_fu1:
-        p = dict(zip(COLS, row))
-        if p.get("followup1_draft_id"):
-            log.info(f"Skipping {p['email_address']} — draft already exists.")
-            continue
-        if p.get("followup1_sent_at"):
-            log.info(f"Skipping {p['email_address']} — follow-up already sent.")
-            continue
-        log.info(f"Writing Day 6 follow-up for {p['company_name'] or p['email_address']}")
+    log.info(f"T1 generated: subject={email['subject']!r}")
+
+    if args.dry_run:
+        _print_dry_run(lead.email, 1, enrichment, email)
+        return False
+
+    try:
+        msg_id, sent_thread_id = send_t1_via_new_message(
+            service,
+            to_email=lead.email,
+            from_email=SENDER_EMAIL, from_name=SENDER_NAME,
+            subject=email["subject"], body=email["body"],
+        )
+    except Exception as exc:
+        log.exception(f"Gmail send failed for thread {thread_id}: {exc}")
+        log_error(conn, "critical", thread_id, f"send: {exc}")
+        return False
+
+    log.info(f"T1 sent: msg_id={msg_id} new_thread={sent_thread_id} to={lead.email}")
+    log_send(conn, sent_thread_id, 1, msg_id, lead.email)
+    cache_enrichment(conn, sent_thread_id, enrichment)
+    _safe_move(lm, sent_thread_id, None, LABEL_SENT_T1, log)
+    delete_intake_draft(service, draft_id)
+    _safe_remove_label(lm, service, thread_id, LABEL_QUEUED, log)
+    return True
+
+
+# ---- T2 / T3 / T4 ---------------------------------------------------------
+
+def _process_followup(
+    args, log, conn, lm: LabelManager, service, our_email: str,
+    touch_number: int, thread_id: str, payload: dict,
+) -> bool:
+    enrichment = payload["enrichment"]
+    last_send = payload["last_send"]
+    recipient = last_send["recipient_email"]
+
+    label_map = {
+        2: (LABEL_SENT_T1, LABEL_SENT_T2),
+        3: (LABEL_SENT_T2, LABEL_SENT_T3),
+        4: (LABEL_SENT_T3, LABEL_SENT_T4),
+    }
+    from_label, to_label = label_map[touch_number]
+
+    if already_sent(conn, thread_id, touch_number):
+        log.warning(
+            f"Thread {thread_id} already has T{touch_number}. Fixing label only."
+        )
+        _safe_move(lm, thread_id, from_label, to_label, log)
+        return False
+
+    # Phase 3 reply check: classify any inbound and dispatch.
+    # OOO replies don't stop the sequence (we continue to send the follow-up).
+    # Real / unsubscribe / bounce do — orchestrator handles them just like
+    # reply_detector.py does, with the same dedup table so the two paths
+    # never double-notify on the same message.
+    inbound = classify_thread(service, thread_id, our_email)
+    if inbound.kind == "real":
+        log.info(
+            f"Thread {thread_id} has a real reply (from {inbound.from_address!r}) — "
+            f"pausing sequence, moving to {LABEL_REPLIED}."
+        )
+        if args.dry_run:
+            return False
+        already = inbound.message_id and is_reply_notified(conn, thread_id, inbound.message_id)
+        _safe_move(lm, thread_id, from_label, LABEL_REPLIED, log)
+        if not already:
+            _notify_real_reply_from_orchestrator(
+                service=service, conn=conn, log=log,
+                thread_id=thread_id, enrichment=enrichment, inbound=inbound,
+            )
+            if inbound.message_id:
+                mark_reply_notified(conn, thread_id, inbound.message_id, kind="real")
+        return False
+
+    if inbound.kind == "unsubscribe":
+        log.info(f"Thread {thread_id}: unsubscribe detected; silent DNC.")
+        if args.dry_run:
+            return False
+        if recipient:
+            add_do_not_contact(conn, recipient, "unsubscribe-orchestrator")
+        _safe_move(lm, thread_id, from_label, LABEL_DO_NOT_CONTACT, log)
+        if inbound.message_id:
+            mark_reply_notified(conn, thread_id, inbound.message_id, kind="unsubscribe")
+        return False
+
+    if inbound.kind == "bounce":
+        log.info(f"Thread {thread_id}: bounce detected; closing thread.")
+        if args.dry_run:
+            return False
+        if recipient:
+            add_bounce(conn, recipient, "hard")
+        _safe_move(lm, thread_id, from_label, LABEL_CLOSED_LOST, log)
+        if inbound.message_id:
+            mark_reply_notified(conn, thread_id, inbound.message_id, kind="bounce")
+        return False
+
+    if inbound.kind == "ooo":
+        # Spec SECTION 9: OOO does NOT pause the sequence. Continue to send.
+        log.info(f"Thread {thread_id}: OOO detected; sequence continues.")
+        if inbound.message_id and not args.dry_run:
+            mark_reply_notified(conn, thread_id, inbound.message_id, kind="ooo")
+        # fall through to generation + send
+
+    # Fetch thread metadata for proper reply threading.
+    try:
+        meta = get_thread_metadata(service, thread_id, our_email)
+    except Exception as exc:
+        log.error(f"Could not load thread metadata for {thread_id}: {exc}")
+        log_error(conn, "error", thread_id, f"thread_meta: {exc}")
+        return False
+
+    # Sender-side preferred recipient: cached send_log value. If we somehow
+    # lost it, fall back to the To: from the thread.
+    if not recipient and meta.get("recipient"):
+        recipient = meta["recipient"]
+    if not recipient:
+        log.error(f"Thread {thread_id} has no known recipient. Skipping.")
+        return False
+
+    # Re-check the DNC / bounce list before every follow-up.
+    block_reason = is_blocked(conn, recipient)
+    if block_reason:
+        log.info(f"Thread {thread_id} recipient now blocked ({block_reason}); skipping.")
+        if not args.dry_run:
+            _safe_move(lm, thread_id, from_label, LABEL_DO_NOT_CONTACT, log)
+        return False
+
+    t1_subject = meta.get("first_subject") or ""
+
+    # Generate the right touch.
+    try:
+        if touch_number == 2:
+            email = generate_t2(enrichment, t1_subject, SKILL_FILE)
+        elif touch_number == 3:
+            email = generate_t3(enrichment, SKILL_FILE)
+        else:  # 4
+            email = generate_t4(enrichment, SKILL_FILE)
+    except GenerationError as exc:
+        log.error(f"T{touch_number} GENERATION_FAILED on {thread_id}: {exc}")
+        log_error(conn, "error", thread_id, f"t{touch_number} generation: {exc}")
+        if not args.dry_run:
+            _safe_move(lm, thread_id, from_label, LABEL_GEN_FAILED, log)
+        return False
+
+    log.info(f"T{touch_number} generated: subject={email['subject']!r}")
+
+    if args.dry_run:
+        _print_dry_run(recipient, touch_number, enrichment, email)
+        return False
+
+    try:
+        msg_id, sent_thread_id = send_followup_reply(
+            service,
+            thread_id=thread_id,
+            to_email=recipient,
+            from_email=SENDER_EMAIL, from_name=SENDER_NAME,
+            subject=email["subject"], body=email["body"],
+            in_reply_to=meta.get("last_outbound_message_id"),
+            references=meta.get("references_chain"),
+        )
+    except Exception as exc:
+        log.exception(f"Gmail follow-up send failed for {thread_id}: {exc}")
+        log_error(conn, "critical", thread_id, f"t{touch_number} send: {exc}")
+        return False
+
+    log.info(
+        f"T{touch_number} sent: msg_id={msg_id} thread={sent_thread_id} to={recipient}"
+    )
+    log_send(conn, thread_id, touch_number, msg_id, recipient)
+    _safe_move(lm, thread_id, from_label, to_label, log)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _notify_real_reply_from_orchestrator(
+    *, service, conn, log,
+    thread_id: str, enrichment: dict, inbound,
+) -> None:
+    """Mirror reply_detector's notification when the orchestrator catches a reply
+    before the polling detector did.
+    """
+    company = (enrichment.get("company_name") or "(unknown company)").strip()
+    first_name = (enrichment.get("first_name") or "").strip()
+    title = f"🔥 REPLY: {company} — {first_name}".strip()
+    url = gmail_thread_url(thread_id)
+    excerpt = (inbound.body_excerpt or "").strip()
+    push_message = excerpt[:400] or f"Reply from {inbound.from_address}"
+    send_pushover(title=title, message=push_message, url=url, priority=1)
+    email_body = (
+        f"From: {inbound.from_address}\n"
+        f"Thread: {url}\n\n"
+        f"--- Reply excerpt ---\n{excerpt}\n"
+    )
+    send_email_alert(service, subject=title, body=email_body)
+    log.info(f"Orchestrator-side notifications dispatched for {thread_id}")
+    if not pushover_enabled():
+        log.warning("Pushover not configured — used email backup only.")
+
+
+def _safe_move(lm, thread_id, from_label, to_label, log) -> None:
+    try:
+        lm.move_thread(thread_id, from_label, to_label)
+    except Exception as exc:
+        log.error(f"Label move failed ({from_label} -> {to_label}) on {thread_id}: {exc}")
+
+
+def _safe_remove_label(lm, service, thread_id, label_name, log) -> None:
+    try:
+        from googleapiclient.errors import HttpError
         try:
-            subject, body = generate_followup(p, followup_num=1)
-            draft_id, thread_id = create_draft(service, p["email_address"], subject, body)
-            conn.execute("UPDATE prospects SET followup1_draft_id=?, followup1_created_at=? WHERE id=?", (draft_id, datetime.now().isoformat(), p["id"]))
-            conn.commit()
-            log.info(f"Draft saved: {subject}")
-            try:
-                service.users().threads().modify(
-                    userId='me',
-                    id=thread_id,
-                    body={'addLabelIds': ['Label_1']}
-                ).execute()
-                log.info(f"Label 'waymark/cold-outreach' applied to thread {thread_id}")
-            except Exception as label_err:
-                log.warning(f"Failed to apply label to thread {thread_id}: {label_err}")
-        except Exception as e:
-            log.error(f"Failed: {e}")
-    for row in due_fu2:
-        p = dict(zip(COLS, row))
-        if p.get("followup2_draft_id"):
-            log.info(f"Skipping {p['email_address']} — draft already exists.")
-            continue
-        if p.get("followup2_sent_at"):
-            log.info(f"Skipping {p['email_address']} — follow-up already sent.")
-            continue
-        log.info(f"Writing Day 13 follow-up for {p['company_name'] or p['email_address']}")
-        try:
-            subject, body = generate_followup(p, followup_num=2)
-            draft_id, thread_id = create_draft(service, p["email_address"], subject, body)
-            conn.execute("UPDATE prospects SET followup2_draft_id=?, followup2_created_at=? WHERE id=?", (draft_id, datetime.now().isoformat(), p["id"]))
-            conn.commit()
-            log.info(f"Draft saved: {subject}")
-            try:
-                service.users().threads().modify(
-                    userId='me',
-                    id=thread_id,
-                    body={'addLabelIds': ['Label_1']}
-                ).execute()
-                log.info(f"Label 'waymark/cold-outreach' applied to thread {thread_id}")
-            except Exception as label_err:
-                log.warning(f"Failed to apply label to thread {thread_id}: {label_err}")
-        except Exception as e:
-            log.error(f"Failed: {e}")
-    conn.close()
-    log.info("Engine complete")
+            service.users().threads().modify(
+                userId="me", id=thread_id,
+                body={"removeLabelIds": [lm.get_id(label_name)]},
+            ).execute()
+        except HttpError as e:
+            if e.resp.status != 404:
+                raise
+    except Exception as exc:
+        log.warning(f"Could not remove label {label_name} from {thread_id}: {exc}")
+
+
+def _print_dry_run(recipient: str, touch_number: int, enrichment: dict, email: dict) -> None:
+    print()
+    print("=" * 70)
+    print(f"DRY RUN — would send T{touch_number} to {recipient}")
+    print(f"From:    {SENDER_NAME} <{SENDER_EMAIL}>")
+    print(f"Subject: {email['subject']}")
+    print(f"Angle:   {enrichment.get('primary_angle')} "
+          f"(secondary: {enrichment.get('secondary_angle')})")
+    print(f"Anchor:  {enrichment.get('best_anchor')}")
+    print("-" * 70)
+    print(email["body"])
+    print("=" * 70)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Waymark Cold Email Engine v2 — Phases 1+2")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Generate but do not send or change labels")
+    p.add_argument("--limit", type=int, default=1,
+                   help="Max sends in this run (default 1)")
+    p.add_argument("--ignore-pacing", action="store_true",
+                   help="Bypass pacing checks. Still respects daily cap. Test only.")
+    p.add_argument("--test-mode", action="store_true",
+                   help="Allow consumer domains as recipients. Test only.")
+    p.add_argument("--list-only", action="store_true",
+                   help="Print queued + eligible follow-ups, take no action")
+    p.add_argument("--only-touch", type=int, choices=[1, 2, 3, 4], default=None,
+                   help="Only consider sends of the given touch number this run")
+    return p.parse_args()
+
+
+def main() -> int:
+    setup_logging()
+    try:
+        return run_engine(parse_args())
+    except Exception as exc:
+        logging.getLogger("orchestrator").exception(f"Fatal error: {exc}")
+        traceback.print_exc()
+        return 1
+
 
 if __name__ == "__main__":
-    run()
+    sys.exit(main())

@@ -1,5 +1,23 @@
+# Secrets — NEVER commit
 .env
+.env.local
 credentials.json
 token.json
+followup_engine/credentials.json
+followup_engine/token.json
+followup_engine/calendar_credentials.json
+followup_engine/calendar_token.json
+
+# Operational SQLite databases (contain prospect data + send history)
 tracker.db
+followup_engine/tracker.db
+followup_engine/followup_engine.db
+followup_engine/waymark_engine.db
+
+# Logs
 logs/
+followup_engine/logs/
+
+# macOS junk
+.DS_Store
+**/.DS_Store

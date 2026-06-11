@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.waymark.followupengine — outbound sender
+  Fires every 15 minutes. The script self-gates against the send window
+  (9:00 AM - 4:30 PM ET, M-F, holidays skipped via SQLite holiday_calendar),
+  so off-hours ticks are safe no-ops. ANTHROPIC_API_KEY is loaded from
+  followup_engine/.env by the Python script.
+
+  TO INSTALL (after Phase 3+4 testing passes):
+    1. launchctl unload ~/Library/LaunchAgents/com.waymark.followupengine.plist  # unload old
+    2. cp /Users/jamie/Documents/waymark-hr-group/followup_engine/launchd_templates/com.waymark.followupengine.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.waymark.followupengine.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.waymark.followupengine</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/jamie/Documents/waymark-hr-group/followup_engine/run.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/jamie/Documents/waymark-hr-group/followup_engine/logs/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jamie/Documents/waymark-hr-group/followup_engine/logs/cron.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
