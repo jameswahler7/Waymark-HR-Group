@@ -1,16 +1,42 @@
 #!/bin/bash
-# run.sh — Waymark cold email engine cron entry point (Phases 1+2 sender)
+# run.sh — Waymark cold email engine cron entry point
 #
-# This is the launchd shim for com.waymark.followupengine. The plist fires
-# every 15 minutes via StartInterval. The Python script self-gates against
-# the spec's send window (9:00 AM - 4:30 PM ET, M-F, holidays skipped), so
-# off-hours ticks no-op cleanly.
+# Hardened June 12, 2026:
+#   - Explicit minimal PATH (no inheritance from launchd's empty env)
+#   - Absolute python path pinned to a variable
+#   - .env sourced in bash before python (defense in depth; python-dotenv
+#     also loads it, but exported vars cover any spawned subprocess)
+#   - Brief DNS-availability gate so a tick that fires before network is
+#     ready waits up to ~25s instead of crashing
 #
-# --limit 25 is the per-tick cap. Pacing rules inside the script (12-28 min
-# randomized gap, rolling 60-min burst cap, daily 25-send cap) keep the
-# effective rate at roughly one send per tick during business hours.
+# NOTE: this script alone does NOT fix the macOS TCC permission issue that
+# is the actual blocker for the launchd ticks. TCC fix lives in
+# System Settings -> Privacy & Security -> Full Disk Access.
 
 set -euo pipefail
-cd /Users/jamie/Documents/waymark-hr-group/followup_engine
+
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+PROJECT_DIR=/Users/jamie/Documents/waymark-hr-group/followup_engine
+PYTHON=/usr/bin/python3
+
+cd "$PROJECT_DIR"
 mkdir -p logs
-/usr/bin/python3 followup_engine.py --limit 25 >> logs/cron.log 2>&1
+
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
+# Wait up to ~25s for DNS to be ready (sleep/wake cycles can leave
+# launchd ticks firing before mDNSResponder is fully back).
+for i in 1 2 3 4 5; do
+    if /usr/bin/dscacheutil -q host -a name oauth2.googleapis.com >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+
+"$PYTHON" followup_engine.py --limit 25 >> logs/cron.log 2>&1
