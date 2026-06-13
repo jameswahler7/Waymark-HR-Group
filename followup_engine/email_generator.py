@@ -21,6 +21,7 @@ Spec reference: SECTION 7.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import os
@@ -72,6 +73,69 @@ _TRAILING_PS_RE = re.compile(
     r"\n\s*\n\s*p\.?\s*s\.?\b.*$",
     re.IGNORECASE | re.DOTALL,
 )
+
+# ---------------------------------------------------------------------------
+# PS month grounding
+# ---------------------------------------------------------------------------
+# Bug seen 2026-06-12: T1 PS shipped with "One slot open for January." in June
+# because the skill file's approved formula has a "[Month]" placeholder and the
+# model has no date grounding -- it pattern-matches off training data. Fix is
+# belt + suspenders: (1) tell the model the current date in the user prompt;
+# (2) post-process the PS line to overwrite any month name (or unfilled
+# placeholder) with the actual current month. Layer 2 makes the bug
+# unrecurrable even if the model ignores layer 1.
+
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_MONTH_ABBR = [m[:3] for m in _MONTH_NAMES]  # Jan, Feb, Mar, ...
+_MONTH_TOKEN_RE = re.compile(
+    r"\b(" + "|".join(_MONTH_NAMES + _MONTH_ABBR) + r")\b",
+    re.IGNORECASE,
+)
+_MONTH_PLACEHOLDER_RE = re.compile(r"\[\s*month\s*\]", re.IGNORECASE)
+# Match the LAST P.S. line in the body (single-line PS — the spec format).
+_PS_LINE_FOR_GROUNDING_RE = re.compile(
+    r"^(\s*p\.?\s*s\.?\b[^\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _current_month_name() -> str:
+    """Return the current month name (e.g. 'June') in local time."""
+    return _dt.date.today().strftime("%B")
+
+
+def _current_date_str() -> str:
+    """Return a human-readable date string for the user prompt."""
+    return _dt.date.today().strftime("%A, %B %d, %Y")
+
+
+def _ground_ps_month(body: str, current_month: Optional[str] = None) -> str:
+    """In the body's LAST P.S. line, replace any month name or [Month] placeholder
+    with the current month. Limited to the PS line — never touches body copy.
+
+    Returns the unchanged body if there is no PS line or no month token there.
+    No-op on the canonical T2/T3/T4 PS (it contains no month).
+    """
+    current = current_month or _current_month_name()
+    matches = list(_PS_LINE_FOR_GROUNDING_RE.finditer(body))
+    if not matches:
+        return body
+    last = matches[-1]
+    ps_line = last.group(1)
+
+    new_ps = _MONTH_PLACEHOLDER_RE.sub(current, ps_line)
+    new_ps = _MONTH_TOKEN_RE.sub(current, new_ps)
+
+    if new_ps == ps_line:
+        return body
+
+    log.info(
+        f"PS month grounded to {current!r}: rewrote {ps_line.strip()!r} -> {new_ps.strip()!r}"
+    )
+    return body[: last.start()] + new_ps + body[last.end():]
 
 # Spec SECTION 3 + skill file PART 3.
 BANNED_WORDS = {
@@ -224,6 +288,13 @@ def _build_user_prompt(
     )
 
     base = f"""\
+CURRENT DATE: {_current_date_str()}
+This is the actual calendar date this email will send. Ground every
+time-sensitive reference in this date. The P.S. scarcity line MUST use the
+current month name -- do NOT guess a different month. The engine will
+overwrite the PS month after generation if you get it wrong, but write the
+correct month the first time anyway.
+
 Generate Touch {touch_number} for this lead. Follow every rule in the skill
 above AND the v2 appendix.
 
@@ -581,6 +652,11 @@ def _generate(
         # T1 keeps whatever PS the model wrote (real scarcity formula).
         if touch_number in (2, 3, 4):
             email["body"] = _force_followup_ps(email["body"], T234_PS_LINE)
+
+        # Ground the PS month for ALL touches. For T1 this fixes hallucinated
+        # months ("One slot open for January" in June). For T2/T3/T4 the
+        # canonical PS has no month, so this is a no-op.
+        email["body"] = _ground_ps_month(email["body"])
 
         problem = _validate(
             email, touch_number, url_for_this_touch,
